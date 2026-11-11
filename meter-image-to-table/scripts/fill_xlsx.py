@@ -2,6 +2,7 @@
 """Write approved numbers into blank XLSX cells with minimal OOXML changes."""
 import argparse
 import hashlib
+import io
 import json
 import math
 import os
@@ -47,11 +48,10 @@ def worksheets(z):
 
 
 def patch_sheet(content, changes):
-    # Restrict editing to ordinary Excel-generated, unprefixed worksheet XML.
     if re.search(rb'<(?:\w+:)?sheetProtection(?:\s|/|>)', content):
         raise ValueError('工作表受保护，不予写入')
     if re.search(rb'<\w+:(?:worksheet|sheetData|row|c)(?:\s|/|>)', content):
-        raise ValueError('工作表 XML 使用不支持的命名空间前缀')
+        return patch_prefixed_sheet(content, changes)
     for coordinate, number in changes:
         col, row = coordinate_from_string(coordinate)
         row_pat = rb'<row\b(?=[^>]*\br="' + str(row).encode() + rb'")[^>]*(?:/>|>.*?</row\s*>)'
@@ -91,6 +91,47 @@ def patch_sheet(content, changes):
             if position is None:
                 position = cells[-1].end() if cells else rowxml.find(b'>') + 1
             rowxml = rowxml[:position] + new + rowxml[position:]
+        content = content[:rm.start()] + rowxml + content[rm.end():]
+    ET.fromstring(content)
+    return content
+
+
+def patch_prefixed_sheet(content, changes):
+    """Patch existing self-closing cells only, with a single verified prefix."""
+    root = re.search(rb'<([A-Za-z_][\w.-]*):worksheet\b[^>]*>', content)
+    if not root:
+        raise ValueError('工作表命名空间格式不受支持')
+    prefix = root.group(1)
+    bindings = list(ET.iterparse(io.BytesIO(content), events=('start-ns',)))
+    matches = [uri for _, (name, uri) in bindings if name == prefix.decode('ascii')]
+    if matches != [NS['m']]:
+        raise ValueError('工作表命名空间前缀未唯一绑定到电子表格命名空间')
+    # Reject nested namespace changes and mixed spreadsheet element prefixes.
+    if len({name for _, (name, _) in bindings}) != len(bindings):
+        raise ValueError('工作表包含重复命名空间声明')
+    for tag in (b'worksheet', b'sheetData', b'row', b'c', b'v', b'f', b'is'):
+        for match in re.finditer(rb'<(/?)(?:([A-Za-z_][\w.-]*):)?' + tag + rb'(?=[\s/>])', content):
+            if match.group(2) != prefix:
+                raise ValueError('工作表包含混合命名空间前缀')
+    esc = re.escape(prefix)
+    for coordinate, number in changes:
+        _, row = coordinate_from_string(coordinate)
+        row_pat = rb'<' + esc + rb':row\b(?=[^>]*\br="' + str(row).encode() + rb'")[^>]*>.*?</' + esc + rb':row\s*>'
+        rows = list(re.finditer(row_pat, content, re.DOTALL))
+        if len(rows) != 1:
+            raise ValueError(f'{coordinate}: 行不存在或不唯一，不写入')
+        rm = rows[0]
+        rowxml = rm.group()
+        cell_pat = rb'<' + esc + rb':c\b(?=[^>]*\br="' + coordinate.encode() + rb'")[^>]*(?:/>|>.*?</' + esc + rb':c\s*>)'
+        cells = list(re.finditer(cell_pat, rowxml, re.DOTALL))
+        if len(cells) != 1:
+            raise ValueError(f'{coordinate}: 前缀工作表只支持已有且唯一的空白单元格')
+        cm = cells[0]
+        cell = cm.group()
+        if not cell.rstrip().endswith(b'/>') or re.search(rb'\bt="(?!n")[^"]+"', cell):
+            raise ValueError(f'{coordinate}: 前缀工作表只支持自闭合的空白数字单元格')
+        replacement = cell.rstrip()[:-2] + b'><' + prefix + b':v>' + str(number).encode('ascii') + b'</' + prefix + b':v></' + prefix + b':c>'
+        rowxml = rowxml[:cm.start()] + replacement + rowxml[cm.end():]
         content = content[:rm.start()] + rowxml + content[rm.end():]
     ET.fromstring(content)
     return content
@@ -162,3 +203,4 @@ if __name__ == '__main__':
     except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, ET.ParseError) as e:
         print(f'写入未完成：{e}', file=sys.stderr)
         raise SystemExit(2)
+
